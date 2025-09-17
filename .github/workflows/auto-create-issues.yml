@@ -1,0 +1,98 @@
+name: Auto Create Issues from Markdown
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'issues/*.md'
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create / Sync Issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const issueDir = 'issues';
+            const files = fs.readdirSync(issueDir).filter(f => f.endsWith('.md'));
+
+            // Collect existing issues (title -> number)
+            const existing = {};
+            const all = await github.paginate(github.rest.issues.listForRepo, { owner: context.repo.owner, repo: context.repo.repo, state: 'all', per_page: 100 });
+            for (const is of all) existing[is.title.trim()] = is.number;
+
+            function parseFrontMatter(txt){
+              if (!txt.startsWith('---')) return {};
+              const end = txt.indexOf('\n---', 3);
+              if (end === -1) return {};
+              const block = txt.substring(3, end).trim();
+              const lines = block.split(/\n/);
+              const meta = {};
+              lines.forEach(l => {
+                const m = l.match(/^([a-zA-Z0-9_]+):\s*(.*)$/);
+                if (m) {
+                  let key = m[1];
+                  let value = m[2].trim();
+                  // arrays like deps: [F1-01, F2-02]
+                  if (value.startsWith('[') && value.endsWith(']')) {
+                    value = value.slice(1,-1).split(',').map(s=>s.trim()).filter(Boolean);
+                  }
+                  meta[key] = value;
+                }
+              });
+              meta.__body = txt.substring(end + 4).trim();
+              return meta;
+            }
+
+            // Ensure labels exist helper
+            async function ensureLabel(name, color, description){
+              try { await github.rest.issues.getLabel({owner: context.repo.owner, repo: context.repo.repo, name}); }
+              catch(e){ await github.rest.issues.createLabel({owner: context.repo.owner, repo: context.repo.repo, name, color, description}); }
+            }
+
+            await ensureLabel('auto-generated', '0366d6', 'Created automatically from issues/*.md');
+
+            let created = 0, skipped = 0, updated = 0;
+            for (const file of files) {
+              const full = path.join(issueDir, file);
+              const txt = fs.readFileSync(full, 'utf8');
+              const meta = parseFrontMatter(txt);
+              if (!meta.title) { core.warning(`Skip ${file}: no title`); continue; }
+              const title = meta.title.trim();
+              const phase = meta.phase ? `phase-${meta.phase}` : null;
+              const id = meta.id ? `id:${meta.id}` : null;
+
+              // Prepare labels
+              const labels = ['auto-generated'];
+              if (phase) { await ensureLabel(phase, '0e8a16', 'Phase label'); labels.push(phase); }
+              if (id) { await ensureLabel(id, '5319e7', 'Task ID'); labels.push(id); }
+
+              const body = meta.__body || '';
+              if (existing[title]) {
+                // Optionally update body if changed (simple contains check)
+                const number = existing[title];
+                // Fetch existing body
+                const current = await github.rest.issues.get({owner: context.repo.owner, repo: context.repo.repo, issue_number: number});
+                if (!current.data.body || current.data.body.indexOf('<!-- synced:') === -1) {
+                  await github.rest.issues.update({owner: context.repo.owner, repo: context.repo.repo, issue_number: number, body: body + `\n\n<!-- synced:${new Date().toISOString()} -->`, labels});
+                  updated++;
+                } else {
+                  skipped++;
+                }
+              } else {
+                await github.rest.issues.create({owner: context.repo.owner, repo: context.repo.repo, title, body: body + `\n\n<!-- synced:${new Date().toISOString()} -->`, labels});
+                created++;
+              }
+            }
+            core.notice(`Created: ${created}, Updated: ${updated}, Skipped: ${skipped}`);
